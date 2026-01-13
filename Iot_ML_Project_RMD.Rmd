@@ -1,0 +1,410 @@
+--- 
+title: "Statistical Computing Final"
+author: "Ethan Montgomery"
+output: beamer_presentation
+--- 
+
+##  Introduction
+
+-  What is an Internet of Things (IoT) system?
+-  Examples
+  - Smart Homes
+  - Predictive Maintenance
+  - Healthcare 
+  - Traffic systems
+- Growing Relevance
+
+##  Protecting our Systems
+
+- Lots of sensors collecting data
+- Data can be a target
+- Systems may also be targeted to disrupt them 
+- This leads to the question I will answer:
+  - Can we use real- time metrics to determine if network access is malicious or
+  not?
+
+##  Data
+
+- Data was found on the UC Irvine ML repository, donated in 2024
+- 123,117 rows X 83 cols
+- Most of the hostile attack patterns are simulated, but they were simulated
+  to be more challenging to ditect than regular attacks
+- significant missing data in 'service' column  (>90%) as well as poor 
+documentation led to removal of that column
+
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(carat)
+library(class)
+library(rpart)
+library(tidymodels)
+library(kknn)
+library(future)
+set.seed(27)
+```
+
+##  Importing data
+
+- import data with the read.csv function
+```{r}
+cyber_data <- read.csv("C:/Users/ethan/OneDrive - Georgia College/R/Statistical Computing Final/RT_IOT2022.csv")
+dim(cyber_data)
+```
+##  looking for Missing Values
+
+- NA values?
+```{r}
+sum(is.na(cyber_data))
+```
+-  No NA values. Lucky!
+-  Removing 'service' feature and another column with all 0s
+```{r}
+cyber_data = cyber_data |> 
+  select(- service) |>
+  select(- bwd_URG_flag_count)
+```
+
+## More model Trimming
+
+- We know we should drop ID columns to prevent overfitting models, as ID
+provides no actual information
+```{r}
+cyber_data = cyber_data |>
+  select(- id.orig_p) |>
+  select(- id.resp_p) |>
+  select(- X)
+dim(cyber_data)
+```
+```{r}
+head(cyber_data)
+```
+
+## Wrangling
+
+- create new feature that specifies if network access is hostile or not
+- For Attack_types column:
+  - MQTT, Thing_Speak, Wipro_bulb_dataset are all normal
+  - Other types are hostile
+```{r}
+cyber_data = cyber_data |> 
+  mutate(Attack = case_when(
+    Attack_type == 'MQTT_Publish' ~ FALSE,
+    Attack_type == 'Thing_Speak' ~ FALSE,
+    Attack_type == 'Wipro_bulb' ~ FALSE,
+    .default = TRUE ))
+
+cyber_data |> count(Attack)
+```
+```{r}
+cyber_data <-  cyber_data |>
+  mutate(Attack_type = factor(Attack_type))
+```
+
+## Wrangling 
+
+- Standardize remaining data
+```{r}
+cyber_data_scaled <-  cyber_data |>
+  select(where(is.numeric)) |>
+  scale()
+unscaled_cols <-  cyber_data |> select(- where(is.numeric))
+cyber_data_scaled = cbind(cyber_data_scaled, unscaled_cols)
+
+dim(cyber_data_scaled) == dim(cyber_data)
+```
+
+## Exploratory Data Analysis
+
+```{r, echo=FALSE}
+ggplot(cyber_data_scaled, aes(Attack, fill = Attack_type)) +
+  geom_bar() + 
+  labs(x='Hostile', y='frequency', title = 'Attack Types')
+```
+
+
+## EDA
+
+- Visualize total attacks based on proportion
+```{r, echo = FALSE}
+#2nd plot is proportion
+ggplot(cyber_data_scaled, aes(Attack, fill = Attack_type)) +
+  geom_bar(position = 'fill') + 
+  labs(x='Hostile', y='frequency', title = 'Attack Types')
+```
+
+
+## EDA
+
+- Based on EDA we see a 2 fold imbalance
+- there are a lot more hostile interactions than normal ones
+- most of the hostile interactions are of type DOS_SYN_HPing
+- We will likely need to use stratification when  creating 
+  test/train split to fix this
+
+
+
+## Model Building -  Principal Componenet Analysis
+
+```{r, echo=FALSE}
+pca_cyber <-  prcomp(cyber_data_scaled |> select(where(is.numeric)))
+plot(pca_cyber, type = 'l', main="Scree Plot")
+abline(h=1,lty=3)
+
+```
+## PCA
+```{r}
+summary(pca_cyber)$importance[,1:10]
+```
+- based on the elbow method and the cumulative proportion, 6 seems like a good choice
+
+
+```{r, echo=FALSE}
+pca_scores <-  as.data.frame(pca_cyber$x[,1:6])
+pca_scores <-  pca_scores |> bind_cols(Attack = cyber_data_scaled$Attack, Attack_type = cyber_data_scaled$Attack_type)
+head(pca_scores)
+```
+```{r}
+dim(pca_scores)
+```
+
+## Model Building T- T split
+
+-  As discussed earlier, need stratification when creating our split due
+  to data imbalance
+```{r, warning = FALSE, message= FALSE}
+cyber_train <-  pca_scores |>
+  group_by(Attack_type) |>
+  sample_frac(0.7)
+cyber_test <-  anti_join(pca_scores, cyber_train)
+```
+
+## Building our model
+
+-  Our objective is classification, so we will try two models:
+-  K- Nearest- Neighbors
+-  Random Forest
+-  Why these models?
+-  Logreg not great for imbalanced data from my understanding
+
+## K- NN Setting up Workflow
+
+- Using workflow from tidymodels allows us to pipline the hyperparamater tuning
+  and then seamlessly choose the best one 
+```{r, warning=FALSE}
+#allows us to use multiple cpu cores
+plan(multisession, workers = 4)
+
+#model -  where we set our model type and hyperparamater tuning
+knn_model <-  nearest_neighbor(
+  neighbors=tune(), #this is the h- p we want to tune
+  weight_func = 'rectangular', 
+  dist_power = 2) |>
+  set_engine('kknn') |>
+  set_mode('classification')
+
+#recipe is basically our formula
+knn_recipe <-  cyber_train |>
+  select(- Attack) |>
+  recipe(Attack_type~.)
+```
+
+
+## K- NN Using CV to tune HP
+
+```{r}
+#workflow object -  combine recipe and model
+knn_wf <-  workflow() |> 
+  add_model(knn_model) |>
+  add_recipe(knn_recipe)
+
+#cross- validation splits
+folds <-  vfold_cv(cyber_train, v=5, strata = Attack_type)
+
+#object that specifies the intervals and range
+knn_grid <-  grid_regular(neighbors(range=c(1,20)), levels =10)
+
+#here is where we actually train. 
+tune_results <-  tune_grid(
+  knn_wf,
+  resamples = folds,
+  grid = knn_grid,
+  metrics = metric_set(precision, recall, f_meas) #macro
+)
+```
+
+## K- NN Results
+
+```{r}
+#display our result
+tune_results |>
+  collect_metrics()
+
+#save the best k value
+best_k <-  tune_results |>
+  select_best(metric = 'f_meas')
+```
+
+## K- NN Graphs
+
+```{r, echo = FALSE}
+autoplot(tune_results)
+```
+
+## K- NN Testing
+
+-  Since we now have our optimal k, we can train on all the data, then do our   
+final testing
+-  We use precision recall and F1 as our accuracy measure
+-  precision = Correct class A preds / all class A preds
+-  recall = Correct class A 
+-  f1 = 2 * precision * recall / precision + recall
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+#finalize workflow  
+final_knn_wf <-  finalize_workflow(knn_wf, best_k)
+
+#train on all of data 
+final_knn_model <-  fit(final_knn_wf, data = cyber_train)
+
+#use HOT
+test_preds <-  predict(final_knn_model, new_data = cyber_test) |>
+  bind_cols(cyber_test |> select(Attack_type))
+```
+
+```{r, echo=FALSE, warning=FALSE}
+#precision, Recall and F1
+knn_metrics <-  metric_set(precision, recall, f_meas)(
+  test_preds, 
+  truth = Attack_type,
+  estimate = .pred_class) |>
+  mutate(knn_estimate = .estimate) |>
+  select(- .estimate)
+
+knn_metrics
+```
+
+
+## Random Forest -  Setting up Model
+
+-  Exact same process for Random Forest, but we will tune mtry and #of trees
+-  Used ranger package 
+```{r}
+
+rf_model <-  rand_forest(
+  mode='classification',
+  mtry = tune(),
+  trees = tune())|>
+  set_engine('ranger')
+
+rf_grid <-  grid_regular(
+  mtry(range = c(1,2)),
+  trees(range = c(100,1000)),
+  levels=5
+)
+```
+
+```{r, echo=FALSE}
+
+rf_recipe <-  cyber_train |>
+  select(- Attack)|>
+  recipe(Attack_type~.)
+
+rf_wf <-  workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model)
+
+rf_tune_resuls <-  tune_grid(
+  rf_wf, 
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_set(precision, recall, f_meas)
+)
+
+rf_tune_resuls |> collect_metrics() |>
+  arrange(desc(mean)) |>
+  filter(.metric=='f_meas') |>
+  slice_head(n=5)
+```
+```{r echo=FALSE}
+rf_best <-   rf_tune_resuls |>
+  select_best(metric = 'f_meas')
+rf_best
+
+rf_100 <-  rf_tune_resuls |> collect_metrics() |>
+  arrange(desc(mean)) |>
+  filter(.metric=='f_meas') |>
+  filter(mtry==2) |>
+  filter(trees==100) |>
+  select(mtry, trees, .config)
+```
+
+## RF -  Finalizing Workflow and Results
+
+```{r, echo=FALSE, warning=FALSE}
+final_rf_wf <-  finalize_workflow(rf_wf, rf_best)
+
+final_rf_model <-  fit(final_rf_wf, data = cyber_train)
+
+rf_test_preds <-  predict(final_rf_model, new_data = cyber_test) |>
+  bind_cols(cyber_test |> select(Attack_type))
+```
+```{r, echo=FALSE}
+#precision, Recall and F1
+rf_metrics <- metric_set(precision,recall,f_meas)(
+  rf_test_preds,
+  truth = Attack_type,
+  estimate = .pred_class) |>
+  mutate(rf_estimate = .estimate) |>
+  select(- .estimate)
+rf_metrics
+```
+
+
+## RF 100 Tree Model
+
+-  Since scores were comparable, I wanted to look at a final verson of the 100 
+  tree model.
+```{r echo=FALSE, warning=FALSE}
+final_rf_wf_100 <-  finalize_workflow(rf_wf, rf_best)
+
+final_rf_model_100 <-  fit(final_rf_wf_100, data = cyber_train)
+
+rf_100_test_preds <-  predict(final_rf_model_100, new_data = cyber_test) |>
+  bind_cols(cyber_test |> select(Attack_type))
+
+rf_100_metrics <-  metric_set(precision, recall, f_meas)(
+  rf_100_test_preds,
+  truth = Attack_type,
+  estimate = .pred_class) |>
+  mutate(rf_100_estimate = .estimate) |>
+  select(- .estimate)
+
+rf_100_metrics |> select(-.estimator)
+```
+
+
+## Conclusion
+
+-  Both models preform considerably well despite class imbalance
+-  given the large nature of this dataset, k- nn could take up too much system 
+memory to be realistic to implement in a IoT network.
+-  The answer to our question appears to be yes
+```{r}
+rf_100_metrics |>
+  bind_cols(rf_metrics |> select(rf_estimate))|>
+  bind_cols(knn_metrics |> select(knn_estimate)) |>
+  select(-.estimator)
+```
+
+## Sources
+
+-  Data: S., B. and Rohini Nagapadma. "RT- IoT2022 ." 
+  UCI Machine Learning Repository, 2023, https://doi.org/10.24432/C5P338. 
+-  great resource 
+-  https://dials.tidymodels.org/reference/index.html 
+  - tidymodels website is pretty good 
+-  Class Notes
+ 
+
